@@ -11,6 +11,7 @@ impl DwMeshRenderer {
         device: &wgpu::Device,
         camera_buf: &wgpu::Buffer,
         albedo_texture: &Texture,
+        sign_font_texture: &Texture,
         render_settings_buf: &wgpu::Buffer,
         world_dim_x_buf: &wgpu::Buffer,
         hover_on_id_buf: &wgpu::Buffer,
@@ -99,6 +100,23 @@ impl DwMeshRenderer {
                     },
                     count: None,
                 },
+                // Sign glyph atlas
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -132,6 +150,14 @@ impl DwMeshRenderer {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: selected_id_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&sign_font_texture.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::Sampler(&sign_font_texture.sampler),
                 },
             ],
             label: Some("dw_bind_group"),

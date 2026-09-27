@@ -31,7 +31,7 @@ pub struct CameraUniform {
 
 impl Camera {
     pub const MAX_BLOCK_Z: f32 = 3.0;
-    pub const MAX_Z: f32 = 1e8;
+    pub const MAX_Z: f32 = 2000.0;
     const EPSILON: f32 = 1e-5;
 
     fn eye(&self) -> Vec3 {
@@ -163,11 +163,27 @@ impl Camera {
     }
 
     pub fn handle_zoom(&mut self, pos: (f32, f32), viewport_size: (f32, f32), scroll_y: f32) {
+        self.zoom_to_distance(
+            pos,
+            viewport_size,
+            self.world_offset.z * (1.0 - scroll_y * 8e-3),
+        );
+    }
+
+    pub fn handle_pinch_zoom(
+        &mut self,
+        pos: (f32, f32),
+        viewport_size: (f32, f32),
+        zoom_factor: f32,
+    ) {
+        self.zoom_to_distance(pos, viewport_size, self.world_offset.z / zoom_factor);
+    }
+
+    fn zoom_to_distance(&mut self, pos: (f32, f32), viewport_size: (f32, f32), distance: f32) {
         let world_pos_before_zoom = self.mouse_at(pos, viewport_size);
         let old_z = self.world_offset.z;
 
-        self.world_offset.z *= 1.0 - scroll_y * 8e-3;
-        self.world_offset.z = self.world_offset.z.clamp(Self::MAX_BLOCK_Z, Self::MAX_Z);
+        self.world_offset.z = distance.clamp(Self::MAX_BLOCK_Z, Self::MAX_Z);
         let new_z = self.world_offset.z;
 
         if new_z != old_z {

@@ -650,12 +650,16 @@ pub trait DwQuad {
     fn quad(&self) -> [[f32; 3]; 4];
     fn normal(&self) -> [f32; 3];
     fn uv_min_max(&self) -> [[f32; 2]; 2];
+    fn is_sign_text(&self) -> bool {
+        false
+    }
 
     fn vertices(&self, id: &DwChunkObjId, chunk_coord: &ChunkCoord) -> ([DwVertex; 4], [u32; 6]) {
         let [bottom_left, bottom_right, top_right, top_left] = self.quad();
 
         let normal = self.normal();
         let [[u_min, v_min], [u_max, v_max]] = self.uv_min_max();
+        let is_sign_text = self.is_sign_text() as u32;
 
         let raw_id = id.raw_id();
         let chunk = (*chunk_coord).into();
@@ -668,6 +672,7 @@ pub trait DwQuad {
                     position: bottom_left.map(|v| v),
                     normal,
                     tex_coords: [u_min, v_max],
+                    is_sign_text,
                 },
                 DwVertex {
                     raw_id,
@@ -675,6 +680,7 @@ pub trait DwQuad {
                     position: bottom_right.map(|v| v),
                     normal,
                     tex_coords: [u_max, v_max],
+                    is_sign_text,
                 },
                 DwVertex {
                     raw_id,
@@ -682,6 +688,7 @@ pub trait DwQuad {
                     position: top_right.map(|v| v),
                     normal,
                     tex_coords: [u_max, v_min],
+                    is_sign_text,
                 },
                 DwVertex {
                     raw_id,
@@ -689,6 +696,7 @@ pub trait DwQuad {
                     position: top_left.map(|v| v),
                     normal,
                     tex_coords: [u_min, v_min],
+                    is_sign_text,
                 },
             ],
             [0, 1, 2, 0, 2, 3],
@@ -710,6 +718,7 @@ pub struct DwFace {
     bottom_left: [f32; 3],
     size: [f32; 2],
     uv_min_max: [[f32; 2]; 2],
+    is_sign_text: bool,
 }
 
 impl DwQuad for DwFace {
@@ -741,6 +750,10 @@ impl DwQuad for DwFace {
     fn uv_min_max(&self) -> [[f32; 2]; 2] {
         self.uv_min_max
     }
+
+    fn is_sign_text(&self) -> bool {
+        self.is_sign_text
+    }
 }
 
 impl DwFace {
@@ -756,6 +769,21 @@ impl DwFace {
             bottom_left,
             size: size.map(|v| v as f32),
             uv_min_max: bottom_left_tile.uv_min_max(w, h),
+            is_sign_text: false,
+        }
+    }
+
+    pub fn new_sign_glyph(
+        bottom_left: [f32; 3],
+        size: [f32; 2],
+        uv_min_max: [[f32; 2]; 2],
+    ) -> Self {
+        Self {
+            face_direction: FaceDirection::Front,
+            bottom_left,
+            size,
+            uv_min_max,
+            is_sign_text: true,
         }
     }
 
@@ -1218,10 +1246,11 @@ pub struct DwVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub tex_coords: [f32; 2],
+    pub is_sign_text: u32,
 }
 
 impl DwVertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Float32x3, 3 => Float32x3, 4 => Float32x2];
+    const ATTRIBS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![0 => Uint32, 1 => Uint32, 2 => Float32x3, 3 => Float32x3, 4 => Float32x2, 5 => Uint32];
     pub fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<DwVertex>() as wgpu::BufferAddress,

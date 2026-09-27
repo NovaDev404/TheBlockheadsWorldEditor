@@ -3,6 +3,7 @@ use super::gpu::{
     dw::{
         DwChunkBuf, DwChunkObjId, DwChunkObjIdUniform, DwIconVertex, DwItemInstanceRaw, DwVertex,
     },
+    voxel_util,
 };
 use eframe::{egui, egui_wgpu, wgpu};
 use std::sync::{
@@ -190,6 +191,7 @@ mod grid;
 mod item;
 pub(crate) mod item_grid;
 mod mesh;
+pub(crate) mod sign_font;
 mod ssao;
 pub(crate) mod voxel;
 
@@ -218,10 +220,51 @@ pub struct RenderResources {
     item_grid: item_grid::ItemGridRenderer,
 
     render_settings_buf: wgpu::Buffer,
+
+    // Store textures for HD switching
+    albedo_texture: Texture,
+    items_texture: Texture,
+    reflect_texture: Texture,
+    destruct_texture: Texture,
+    sign_font_texture: Texture,
+    hd_textures: bool,
+    target_format: wgpu::TextureFormat,
 }
 
 impl RenderResources {
     const STAGING_BUFFER_SIZE: u64 = std::mem::size_of::<(u32, u32)>() as u64; // read raw_id and packed_chunk
+
+    fn load_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        base_name: &str,
+        base_size: (u32, u32),
+        hd: bool,
+    ) -> Texture {
+        let bytes: &'static [u8] = match (base_name, hd) {
+            ("TileMap", true) => include_bytes!("../resources/TileMap_HD.png"),
+            ("TileMap", false) => include_bytes!("../resources/TileMap.png"),
+            ("Items", true) => include_bytes!("../resources/Items_HD.png"),
+            ("Items", false) => include_bytes!("../resources/Items.png"),
+            ("TileReflect", true) => include_bytes!("../resources/TileReflect_HD.png"),
+            ("TileReflect", false) => include_bytes!("../resources/TileReflect.png"),
+            ("TileDestruct", true) => include_bytes!("../resources/TileDestruct_HD.png"),
+            ("TileDestruct", false) => include_bytes!("../resources/TileDestruct.png"),
+            _ => panic!("Unknown texture file: {}_HD: {}", base_name, hd),
+        };
+
+        let mut decoder = PngDecoder::new(bytes);
+        let img = decoder.decode().unwrap().u8().unwrap();
+
+        // HD textures are 4x resolution (64x64 vs 16x16 per texture)
+        let size = if hd {
+            (base_size.0 * 4, base_size.1 * 4)
+        } else {
+            base_size
+        };
+
+        Texture::from_img(img.as_slice(), size, device, queue)
+    }
 
     pub fn new(
         state: &egui_wgpu::RenderState,
@@ -229,35 +272,24 @@ impl RenderResources {
         selected_block_buf: wgpu::Buffer,
         hover_on_block_buf: wgpu::Buffer,
         hover_on_dyn_obj_id: Arc<Mutex<Option<(DwChunkObjId, ChunkCoord)>>>,
+        hd_textures: bool,
     ) -> Self {
         let device = &state.device;
         let queue = &state.queue;
         let target_format = state.target_format;
 
-        let albedo_texture = {
-            let bytes = include_bytes!("../resources/TileMap.png");
-            let mut decoder = PngDecoder::new(bytes);
-            let img = decoder.decode().unwrap().u8().unwrap();
-            Texture::from_img(img.as_slice(), (512, 512), device, queue)
-        };
-        let items_texture = {
-            let bytes = include_bytes!("../resources/Items.png");
-            let mut decoder = PngDecoder::new(bytes);
-            let img = decoder.decode().unwrap().u8().unwrap();
-            Texture::from_img(img.as_slice(), (512, 256), device, queue)
-        };
-        let reflect_texture = {
-            let bytes = include_bytes!("../resources/TileReflect.png");
-            let mut decoder = PngDecoder::new(bytes);
-            let img = decoder.decode().unwrap().u8().unwrap();
-            Texture::from_img(img.as_slice(), (512, 512), device, queue)
-        };
-        let destruct_texture = {
-            let bytes = include_bytes!("../resources/TileDestruct.png");
-            let mut decoder = PngDecoder::new(bytes);
-            let img = decoder.decode().unwrap().u8().unwrap();
-            Texture::from_img(img.as_slice(), (512, 512), device, queue)
-        };
+        let albedo_texture = Self::load_texture(device, queue, "TileMap", (512, 512), hd_textures);
+        let items_texture = Self::load_texture(device, queue, "Items", (512, 256), hd_textures);
+        let reflect_texture =
+            Self::load_texture(device, queue, "TileReflect", (512, 512), hd_textures);
+        let destruct_texture =
+            Self::load_texture(device, queue, "TileDestruct", (512, 512), hd_textures);
+        let sign_font_texture = Texture::from_img(
+            &sign_font::rasterize_atlas(),
+            (sign_font::WIDTH, sign_font::HEIGHT),
+            device,
+            queue,
+        );
         let g_buffer = GeometryBuffer::default(device);
         let staging_buffer = device.create_buffer(&wgpu::wgt::BufferDescriptor {
             label: Some("staging buffer"),
@@ -296,6 +328,10 @@ impl RenderResources {
                 device,
                 &camera_buf,
                 world_dim_x_buf.clone(),
+                super::gpu::voxel_util::create_buffer(
+                    device,
+                    voxel::VoxelRenderer::DEFAULT_WORLD_WIDTH_CHUNK as usize,
+                ),
                 &selected_block_buf,
                 &hover_on_block_buf,
                 &hover_on_id_buf,
@@ -322,6 +358,7 @@ impl RenderResources {
                 device,
                 &camera_buf,
                 &albedo_texture,
+                &sign_font_texture,
                 &render_settings_buf,
                 &world_dim_x_buf,
                 &hover_on_id_buf,
@@ -361,10 +398,17 @@ impl RenderResources {
             is_mapping: Arc::new(AtomicBool::new(false)),
             has_new_copy: Arc::new(AtomicBool::new(false)),
             render_settings_buf,
+            albedo_texture,
+            items_texture,
+            reflect_texture,
+            destruct_texture,
+            sign_font_texture,
+            hd_textures,
+            target_format: target_format,
         }
     }
 
-    pub fn voxel_buf(&self) -> &wgpu::Buffer {
+    pub fn voxel_buf(&self) -> &voxel_util::VoxelBuffer {
         &self.voxel.voxel_buf
     }
 
@@ -372,7 +416,7 @@ impl RenderResources {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        new_voxel_buf: wgpu::Buffer,
+        new_voxel_buf: voxel_util::VoxelBuffer,
         world_dim_x: u32,
     ) {
         self.voxel
@@ -387,6 +431,96 @@ impl RenderResources {
                 .resize(&self.g_buffer, &self.camera_buf, device);
             self.voxel.resize(&self.g_buffer, device);
         }
+    }
+
+    pub fn recreate_with_hd_textures(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        hd: bool,
+    ) {
+        if self.hd_textures == hd {
+            return;
+        }
+
+        self.hd_textures = hd;
+
+        // Reload textures with new HD setting
+        self.albedo_texture = Self::load_texture(device, queue, "TileMap", (512, 512), hd);
+        self.items_texture = Self::load_texture(device, queue, "Items", (512, 256), hd);
+        self.reflect_texture = Self::load_texture(device, queue, "TileReflect", (512, 512), hd);
+        self.destruct_texture = Self::load_texture(device, queue, "TileDestruct", (512, 512), hd);
+
+        // Recreate renderers that depend on these textures, preserving world state.
+        let world_dim_x_buf = self.voxel.world_dim_x_buf.clone();
+        let voxel_buf = self.voxel.voxel_buf.clone();
+
+        // Recreate voxel renderer
+        self.voxel = voxel::VoxelRenderer::new(
+            device,
+            &self.camera_buf,
+            world_dim_x_buf.clone(),
+            voxel_buf,
+            &self.selected_block_buf,
+            &self.hover_on_block_buf,
+            &self.hover_on_id_buf,
+            &self.selected_id_buf,
+            &self.g_buffer,
+            &self.render_settings_buf,
+            &self.albedo_texture,
+            &self.reflect_texture,
+            &self.destruct_texture,
+        );
+
+        // Recreate item renderer
+        self.dw_item = item::DwItemRenderer::new(
+            device,
+            &self.camera_buf,
+            &self.items_texture,
+            &self.albedo_texture,
+            &self.hover_on_id_buf,
+            &self.selected_id_buf,
+            &self.render_settings_buf,
+            &world_dim_x_buf,
+            &self.destruct_texture,
+            &self.reflect_texture,
+        );
+
+        // Recreate mesh renderer
+        self.dw_mesh = mesh::DwMeshRenderer::new(
+            device,
+            &self.camera_buf,
+            &self.albedo_texture,
+            &self.sign_font_texture,
+            &self.render_settings_buf,
+            &world_dim_x_buf,
+            &self.hover_on_id_buf,
+            &self.selected_id_buf,
+        );
+
+        // Recreate composite renderer
+        self.composite = composite::CompositeRenderer::new(
+            device,
+            &self.g_buffer,
+            self.target_format,
+            &self.render_settings_buf,
+            &self.camera_buf,
+            &self.albedo_texture,
+            &self.reflect_texture,
+            &self.destruct_texture,
+        );
+
+        // Recreate item grid renderer
+        self.item_grid = item_grid::ItemGridRenderer::new(
+            device,
+            &self.items_texture,
+            &self.albedo_texture,
+            self.target_format,
+            &self.render_settings_buf,
+            &self.camera_buf,
+            &self.destruct_texture,
+            &self.reflect_texture,
+        );
     }
 
     pub fn render_mesh_pass(&self, render_pass: &mut wgpu::RenderPass<'_>, dw_buf: &[DwChunkBuf]) {

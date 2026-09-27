@@ -105,7 +105,7 @@ fn fs_composite(in: VertexOutput) -> @location(0) vec4<f32> {
     let v_uv_data = textureLoad(voxel_uv_texture, pixel_coords, 0).rg;
     let ssao_raw = textureSampleLevel(ssao_texture, ssao_sampler, in.uv, 0.0).r;
 
-    var solid_color = vec4<f32>(0.0);
+    var solid_color = vec4<f32>(0.502, 0.75, 1.0, 1.0);
 
     if (surf.has_opaque) {
         if (surf.is_mesh) {

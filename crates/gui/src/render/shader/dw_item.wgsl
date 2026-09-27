@@ -81,20 +81,7 @@ fn vs_dynamic_object_item(model: DynObjVertexInput, instance: DynObjInstanceInpu
 @fragment
 fn fs_dynamic_object_item(in: DynObjVSOutput) -> FragmentOutput {
     var color = sample_item_texture(in.item_type, in.is_block, in.top, in.side, in.uv);
-
-    // Add outline
-    let outline_width: f32 = 0.03; // Adjust as needed for desired thickness
-    let dist_from_edge_x = min(in.uv.x, 1.0 - in.uv.x);
-    let dist_from_edge_y = min(in.uv.y, 1.0 - in.uv.y);
-
-    if (dist_from_edge_x < outline_width || dist_from_edge_y < outline_width) {
-        let outline_alpha: f32 = 0.5;
-        let outline_color: vec4<f32> = vec4<f32>(1.0, 1.0, 1.0, outline_alpha); // White with 0.5 alpha
-
-        // Simple blend, overlaying the outline
-        // You might want a more sophisticated blend mode depending on desired effect
-        color = mix(color, outline_color, outline_color.a);
-    }
+    let is_glow_block = (in.id >> 24u) == 18u;
 
     let hovered = hover_on_id.is_some != 0u
         && in.chunk == hover_on_id.chunk
@@ -114,7 +101,7 @@ fn fs_dynamic_object_item(in: DynObjVSOutput) -> FragmentOutput {
     }
 
     var output: FragmentOutput;
-    output.color = vec4<f32>(final_color, color.a);
+    output.color = vec4<f32>(final_color, select(color.a, 0.0, is_glow_block));
     output.id = vec2<u32>(in.id, in.chunk);
     return output;
 }

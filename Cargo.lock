@@ -3229,10 +3229,12 @@ dependencies = [
 name = "the-blockheads-tools-gui"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "bytemuck",
  "eframe",
  "env_logger",
  "glam",
+ "js-sys",
  "log",
  "num_enum",
  "rayon",
@@ -3240,6 +3242,7 @@ dependencies = [
  "snafu",
  "strum",
  "the-blockheads-tools-lib",
+ "wasm-bindgen",
  "wasm-bindgen-futures",
  "wgpu",
  "wgsl_macro",

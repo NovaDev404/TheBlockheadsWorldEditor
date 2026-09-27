@@ -7,12 +7,13 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::ops::{Deref, DerefMut};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(i8)]
 // Where does the torch connects to
 pub enum TorchConnectionType {
     Bg = -2,
     Left = -1,
+    #[default]
     Ground = 0,
     Right = 1,
     Mg = 2,
@@ -25,6 +26,7 @@ pub enum TorchConnectionType {
 pub struct Torch {
     #[serde(flatten)]
     obj: DynamicObject,
+    #[serde(default)]
     pub light_dict: ArtificialLight,
     pub connection_type: TorchConnectionType,
     pub item_type: ItemType,
@@ -32,6 +34,19 @@ pub struct Torch {
     pub data_b: u16,
 }
 inherit!(Torch -> DynamicObject, obj);
+
+impl Default for Torch {
+    fn default() -> Self {
+        Self {
+            obj: DynamicObject::default(),
+            light_dict: ArtificialLight::default(),
+            connection_type: TorchConnectionType::default(),
+            item_type: ItemType::Torch,
+            data_a: 0,
+            data_b: 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -213,6 +228,7 @@ pub enum SignConnectionType {
 pub struct Sign {
     #[serde(flatten)]
     obj: InteractionObject,
+    #[serde(default)]
     pub text: String,
     pub connection_type: SignConnectionType,
     pub offset_type: u64,
@@ -449,10 +465,16 @@ pub struct OwnershipSign {
         skip_serializing_if = "Option::is_none"
     )]
     pub land_owner_name: Option<String>,
+    #[serde(default = "default_ownership_sign_dimension")]
     pub w: u8,
+    #[serde(default = "default_ownership_sign_dimension")]
     pub h: u8,
 }
 inherit!(OwnershipSign -> Sign, sign);
+
+fn default_ownership_sign_dimension() -> u8 {
+    31
+}
 
 impl Default for OwnershipSign {
     fn default() -> Self {

@@ -285,6 +285,7 @@ impl ChunkDynamicObjects {
     pub fn insert(&mut self, any_dyn_obj: AnyDynamicObject) {
         match any_dyn_obj {
             AnyDynamicObject::Dodo(v) => self.dodo.push(*v),
+            AnyDynamicObject::Torch(v) => self.torch.push(*v),
             AnyDynamicObject::Ladder(v) => self.ladder.push(*v),
             AnyDynamicObject::Door(v) => self.door.push(*v),
             AnyDynamicObject::Bed(v) => self.bed.push(*v),
@@ -406,7 +407,7 @@ impl ChunkDynamicObjects {
             Dodo => AnyDynamicObjectRef::Dodo(self.dodo.get(index)?),
             // DroppedItem => self.dropped_item.get(index),
             // Fire => self.fire.get(index),
-            // Torch => self.torch.get(index),
+            Torch => AnyDynamicObjectRef::Torch(self.torch.get(index)?),
             // GlowBlock => self.glow_block.get(index),
             Ladder => AnyDynamicObjectRef::Ladder(self.ladder.get(index)?),
             Door => AnyDynamicObjectRef::Door(self.door.get(index)?),
@@ -522,29 +523,35 @@ type Result<T> = std::result::Result<T, DynamicWorldError>;
 
 // TODO: handle chest data like `349_20/chest_834` and `trainchest_1342`
 #[derive(Debug)]
-pub struct DynamicWorld(HashMap<ChunkCoord, ChunkDynamicObjects>);
+pub struct DynamicWorld {
+    chunks: HashMap<ChunkCoord, ChunkDynamicObjects>,
+    /// Some multiplayer saves store dynamic-world keys as
+    /// `<client-id>_<x>_<y>/<object-type>`. Keep that prefix so opening and
+    /// saving a world does not change its key format.
+    coord_prefixes: HashMap<ChunkCoord, String>,
+}
 
 impl DynamicWorld {
     pub fn chunk_at<I: Into<ChunkCoord>>(&self, coord: I) -> Option<&ChunkDynamicObjects> {
-        self.0.get(&coord.into())
+        self.chunks.get(&coord.into())
     }
 
     pub fn chunk_at_mut<I: Into<ChunkCoord>>(
         &mut self,
         coord: I,
     ) -> Option<&mut ChunkDynamicObjects> {
-        self.0.get_mut(&coord.into())
+        self.chunks.get_mut(&coord.into())
     }
 
     pub fn entry<I: Into<ChunkCoord>>(
         &'_ mut self,
         coord: I,
     ) -> hash_map::Entry<'_, ChunkCoord, ChunkDynamicObjects> {
-        self.0.entry(coord.into())
+        self.chunks.entry(coord.into())
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&ChunkCoord, &ChunkDynamicObjects)> {
-        self.0.iter()
+        self.chunks.iter()
     }
 
     /// Moves `i`-th obj_type in `src_coord` chunk to `dst_coord`, returns new index in dst chunk
@@ -560,7 +567,7 @@ impl DynamicWorld {
         }
         // ensure dst chunk always exists
         let _ = self.entry(dst_coord).or_default();
-        if let [Some(src), Some(dst)] = self.0.get_disjoint_mut([&src_coord, &dst_coord]) {
+        if let [Some(src), Some(dst)] = self.chunks.get_disjoint_mut([&src_coord, &dst_coord]) {
             src.move_element(dst, obj_type, index)
         } else {
             None
@@ -569,6 +576,7 @@ impl DynamicWorld {
 
     pub fn from_db(db: &Database<Str, Bytes>, rtxn: &RoTxn) -> Result<Self> {
         let mut map = HashMap::new();
+        let mut coord_prefixes = HashMap::new();
         for (k, v) in db
             .iter(rtxn)
             .context(IterateDatabaseSnafu)?
@@ -580,11 +588,31 @@ impl DynamicWorld {
                 }
                 continue;
             };
-            let coord = ChunkCoord::try_from_str(coord_str).with_context(|_| {
+            let mut coord_key = coord_str;
+            let mut prefix = None;
+            if ChunkCoord::try_from_str(coord_str).is_err() {
+                if let Some((candidate_prefix, candidate_coord)) = coord_str.split_once('_') {
+                    if candidate_prefix.len() == 32
+                        && candidate_prefix
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit())
+                        && ChunkCoord::try_from_str(candidate_coord).is_ok()
+                    {
+                        prefix = Some(candidate_prefix);
+                        coord_key = candidate_coord;
+                    }
+                }
+            }
+            let coord = ChunkCoord::try_from_str(coord_key).with_context(|_| {
                 ParseChunkCoordFromStrSnafu {
                     coord: coord_str.to_owned(),
                 }
             })?;
+            if let Some(prefix) = prefix {
+                coord_prefixes
+                    .entry(coord)
+                    .or_insert_with(|| prefix.to_owned());
+            }
             let Ok(obj_ty) = DynamicObjectType::try_from_str(type_id_str) else {
                 if !type_id_str.starts_with("chest_") {
                     println!(
@@ -722,7 +750,10 @@ impl DynamicWorld {
                 DynamicObjectType::Mirror => entry.mirror = load(v, obj_ty, k)?,
             };
         }
-        Ok(Self(map))
+        Ok(Self {
+            chunks: map,
+            coord_prefixes,
+        })
     }
 
     pub fn to_db<W: Write>(&self, db: &Database<Str, Bytes>, wtxn: &mut RwTxn<W>) -> Result<()> {
@@ -749,8 +780,11 @@ impl DynamicWorld {
             Ok(())
         }
 
-        for (coord, obj) in self.0.iter() {
-            let coord_str = coord.to_string();
+        for (coord, obj) in self.chunks.iter() {
+            let coord_str = match self.coord_prefixes.get(coord) {
+                Some(prefix) => format!("{}_{}", prefix, coord),
+                None => coord.to_string(),
+            };
             use DynamicObjectType::*;
             put(db, wtxn, &coord_str, AppleTree, &obj.apple_tree)?;
             put(db, wtxn, &coord_str, MapleTree, &obj.maple_tree)?;
@@ -922,6 +956,47 @@ mod tests {
     }
 
     #[test]
+    fn test_prefixed_dynamic_world_key_round_trip() {
+        let key = "3599470b81eb384f6c7a33a9785ece5b_772_16/13";
+        let value = std::fs::read("resources/type_13.xml").unwrap();
+
+        let mut input = Vec::new();
+        {
+            let mut env_write = EnvWrite::new(&mut input, DynArch::Arch64);
+            let mut wtxn = env_write.write_txn().unwrap();
+            let db = wtxn.create_database::<Str, Bytes>(Some("dw")).unwrap();
+            db.put(&mut wtxn, key, &value).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let env = Env::new(&input).unwrap();
+        let rtxn = env.read_txn().unwrap();
+        let db = env
+            .open_database::<Str, Bytes>(&rtxn, Some("dw"))
+            .unwrap()
+            .unwrap();
+        let dw = DynamicWorld::from_db(&db, &rtxn).unwrap();
+        assert!(dw.chunk_at(ChunkCoord::new(772, 16).unwrap()).is_some());
+
+        let mut output = Vec::new();
+        {
+            let mut env_write = EnvWrite::new(&mut output, DynArch::Arch64);
+            let mut wtxn = env_write.write_txn().unwrap();
+            let db = wtxn.create_database(Some("dw")).unwrap();
+            dw.to_db(&db, &mut wtxn).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let env = Env::new(&output).unwrap();
+        let rtxn = env.read_txn().unwrap();
+        let db = env
+            .open_database::<Str, Bytes>(&rtxn, Some("dw"))
+            .unwrap()
+            .unwrap();
+        assert!(db.get(&rtxn, key).unwrap().is_some());
+    }
+
+    #[test]
     fn test_dynamic_world_round_trip() {
         fn read_test_xml<T: serde::de::DeserializeOwned>(
             obj_type: DynamicObjectType,
@@ -1039,7 +1114,10 @@ mod tests {
         let coord = ChunkCoord::new(10, 20).unwrap();
         let mut map = HashMap::new();
         map.insert(coord, monster);
-        let dw = DynamicWorld(map);
+        let dw = DynamicWorld {
+            chunks: map,
+            coord_prefixes: HashMap::new(),
+        };
 
         // write to buffer
         let mut buffer = Vec::new();

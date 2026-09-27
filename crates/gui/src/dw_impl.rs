@@ -12,6 +12,7 @@ use super::{
     render::{
         ItemGridCallback, ItemGridInstances,
         item_grid::{COL_PX, ITEM_SELECTOR_COLS, ITEM_SELECTOR_ROWS, ITEM_SELECTOR_SIZE, ROW_PX},
+        sign_font,
     },
 };
 use eframe::{
@@ -3142,6 +3143,13 @@ impl ToGrid for AnyDynamicObject {
                     );
                     selectable_variant(
                         ui,
+                        "Torch",
+                        matches!(self, AnyDynamicObject::Torch(_)),
+                        || AnyDynamicObject::Torch(Box::default()),
+                        self,
+                    );
+                    selectable_variant(
+                        ui,
                         "Ladder",
                         matches!(self, AnyDynamicObject::Ladder(_)),
                         || AnyDynamicObject::Ladder(Box::default()),
@@ -3336,6 +3344,9 @@ impl ToGrid for AnyDynamicObject {
             ui.horizontal(|ui| match self {
                 AnyDynamicObject::Dodo(dodo) => {
                     dodo.add_grid("dodo_grid", ui, context);
+                }
+                AnyDynamicObject::Torch(torch) => {
+                    torch.add_grid("torch_grid", ui, context);
                 }
                 AnyDynamicObject::Ladder(ladder) => {
                     ladder.add_grid("ladder_grid", ui, context);
@@ -3599,7 +3610,7 @@ impl ToRow for SignConnectionType {
 
 impl ToGrid for Sign {
     fn to_grid(&mut self, ui: &mut egui::Ui, context: &mut DwUiContext) {
-        self.text.add_row("text", ui);
+        context.flags.rebuild_mesh |= self.text.add_row("text", ui).changed();
         context.flags.rebuild_mesh |= self.connection_type.add_row("connectionType", ui).changed();
         self.offset_type.add_row("offsetType", ui);
     }
@@ -3627,6 +3638,7 @@ fn draw_sign(
     sign: ImageType,
     sign_hang: ImageType,
     connection_type: SignConnectionType,
+    text: &str,
     builder: &mut DwChunkBufBuilder,
 ) {
     let z = 3.0;
@@ -3680,10 +3692,75 @@ fn draw_sign(
             builder.add_face(face);
         }
     }
+
+    if !text.is_empty() && connection_type != SignConnectionType::None {
+        let board_x_offset = match connection_type {
+            SignConnectionType::Side | SignConnectionType::Up => {
+                if flipped {
+                    1.5
+                } else {
+                    0.5
+                }
+            }
+            _ => 1.0,
+        };
+        let board_height = if connection_type == SignConnectionType::Side {
+            2.0
+        } else {
+            1.0
+        };
+        let mut lines = vec![Vec::new()];
+        for character in text.chars() {
+            if character == '\n' {
+                if lines.len() == 2 {
+                    break;
+                }
+                lines.push(Vec::new());
+            } else if character != '\r' {
+                let line = lines.last_mut().unwrap();
+                if line.len() == 20 {
+                    if lines.len() == 2 {
+                        break;
+                    }
+                    lines.push(Vec::new());
+                }
+                lines.last_mut().unwrap().push(character);
+            }
+        }
+        let line_height = (board_height * 0.42 / lines.len() as f32).min(0.24);
+        let advance = line_height * 0.48;
+        let glyph_width = advance * 0.9;
+        let total_height = line_height * lines.len() as f32;
+        let board_center_x = float_pos[0] - board_x_offset + 1.0;
+        let first_line_y = float_pos[1] + (board_height - total_height) * 0.5;
+        for (line_index, line) in lines.iter().enumerate() {
+            let line_width = advance * line.len() as f32;
+            let line_x = board_center_x - line_width * 0.5;
+            let y = first_line_y + (lines.len() - line_index - 1) as f32 * line_height;
+            for (character_index, character) in line.iter().enumerate() {
+                let x = line_x + character_index as f32 * advance;
+                builder.add_face(DwFace::new_sign_glyph(
+                    [x + (advance - glyph_width) * 0.5, y, z + 0.01],
+                    [glyph_width, line_height * 0.82],
+                    sign_font::glyph_uv(*character),
+                ));
+            }
+        }
+    }
 }
 
 impl BuildDwMesh for Sign {
-    const STATIC_CAPACITY: Option<DwCapacity> = Some(DwCapacity::QUAD);
+    fn capacity(&self) -> DwCapacity {
+        DwCapacity {
+            items: 0,
+            quads: 1 + self
+                .text
+                .chars()
+                .filter(|ch| *ch != '\n' && *ch != '\r')
+                .count()
+                .min(40),
+        }
+    }
 
     fn build_dw_mesh(&self, builder: &mut DwChunkBufBuilder) -> Result<(), BuildDwMeshError> {
         draw_sign(
@@ -3694,6 +3771,7 @@ impl BuildDwMesh for Sign {
             ImageType::Sign,
             ImageType::SignHang,
             self.connection_type,
+            &self.text,
             builder,
         );
         Ok(())
@@ -4242,9 +4320,9 @@ impl BuildDwMesh for TulipPlant {
 }
 
 impl ToGrid for OwnershipSign {
-    fn to_grid(&mut self, ui: &mut egui::Ui, _: &mut DwUiContext) {
+    fn to_grid(&mut self, ui: &mut egui::Ui, context: &mut DwUiContext) {
         self.land_owner_id.add_row("landOwnerId", ui);
-        self.land_owner_name.add_row("landOwnerName", ui);
+        context.flags.rebuild_mesh |= self.land_owner_name.add_row("landOwnerName", ui).changed();
         self.w.add_row("width", ui);
         self.h.add_row("height", ui);
     }
@@ -4264,7 +4342,19 @@ impl InfoUi for OwnershipSign {
 }
 
 impl BuildDwMesh for OwnershipSign {
-    const STATIC_CAPACITY: Option<DwCapacity> = Some(DwCapacity::QUAD);
+    fn capacity(&self) -> DwCapacity {
+        DwCapacity {
+            items: 0,
+            quads: 1 + self
+                .land_owner_name
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .filter(|ch| *ch != '\n' && *ch != '\r')
+                .count()
+                .min(40),
+        }
+    }
 
     fn build_dw_mesh(&self, builder: &mut DwChunkBufBuilder) -> Result<(), BuildDwMeshError> {
         draw_sign(
@@ -4275,6 +4365,7 @@ impl BuildDwMesh for OwnershipSign {
             ImageType::OwnershipSign,
             ImageType::OwnershipSignHang,
             self.connection_type,
+            self.land_owner_name.as_deref().unwrap_or_default(),
             builder,
         );
         Ok(())

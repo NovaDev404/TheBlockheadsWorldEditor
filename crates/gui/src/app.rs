@@ -12,8 +12,6 @@ use super::{
 use eframe::{egui, egui_wgpu, emath::Rect, wgpu};
 use glam::Vec3Swizzles;
 use snafu::prelude::*;
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::PathBuf;
 #[cfg(target_arch = "wasm32")]
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -31,10 +29,22 @@ use the_blockheads_tools_lib::{
         dynamic_world::{ChunkDynamicObjects, DynamicWorld},
     },
 };
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+unsafe extern "C" {
+    #[wasm_bindgen(js_namespace = window, js_name = worldEditorServerStatus)]
+    fn world_editor_server_status() -> String;
+
+    #[wasm_bindgen(js_namespace = window, js_name = worldEditorSave)]
+    fn world_editor_save(data: &[u8]) -> js_sys::Promise;
+}
 
 enum ReaderState {
     #[cfg(not(target_arch = "wasm32"))]
-    Native { open_path: Option<PathBuf> },
+    Native,
 
     #[cfg(target_arch = "wasm32")]
     Wasm {
@@ -55,21 +65,12 @@ impl FileReader {
 
         Self {
             #[cfg(not(target_arch = "wasm32"))]
-            state: ReaderState::Native { open_path: None },
+            state: ReaderState::Native,
             #[cfg(target_arch = "wasm32")]
             state: ReaderState::Wasm {
                 sender: tx,
                 receiver: rx,
             },
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn set_open_path(&mut self, new_open_path: Option<PathBuf>) {
-        match &mut self.state {
-            ReaderState::Native { open_path } => {
-                *open_path = new_open_path;
-            }
         }
     }
 
@@ -84,7 +85,7 @@ impl FileReader {
     fn read_file(&mut self) -> Option<std::io::Result<Vec<u8>>> {
         match &mut self.state {
             #[cfg(not(target_arch = "wasm32"))]
-            ReaderState::Native { open_path } => open_path.take().map(std::fs::read),
+            ReaderState::Native => None,
             #[cfg(target_arch = "wasm32")]
             ReaderState::Wasm { receiver, .. } => receiver.try_recv().ok().map(Ok),
         }
@@ -244,7 +245,7 @@ impl ChunkCache {
         }
     }
 
-    fn update_voxels(&mut self, queue: &wgpu::Queue, voxel_buf: &wgpu::Buffer) {
+    fn update_voxels(&mut self, queue: &wgpu::Queue, voxel_buf: &voxel_util::VoxelBuffer) {
         for coord in self.voxel_outdated.drain() {
             if let Some(chunk) = self.decompressed_chunks.get(&coord) {
                 voxel_util::set_chunk(queue, voxel_buf, coord, chunk);
@@ -377,14 +378,28 @@ pub struct EditorApp {
     file_reader: FileReader,
     load_err: Option<EditorAppError>,
     save_err: Option<EditorAppError>,
+    #[cfg(target_arch = "wasm32")]
+    save_status: Arc<Mutex<Option<String>>>,
 
     world_viewport_rect: Rect,
     mouse_pos: Option<(f32, f32)>,
     render_settings: RenderSettings,
+    hd_textures_changed: bool,
 }
 
 impl EditorApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
+        Self::new_internal(cc)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn with_initial_data(cc: &eframe::CreationContext, data: Vec<u8>) -> Self {
+        let app = Self::new_internal(cc);
+        app.file_reader.get_sender().send(data).ok();
+        app
+    }
+
+    fn new_internal(cc: &eframe::CreationContext) -> Self {
         let state = cc
             .wgpu_render_state
             .as_ref()
@@ -393,6 +408,7 @@ impl EditorApp {
 
         let camera = Camera::default();
         let interaction_state = InteractionState::default();
+        let render_settings = RenderSettings::default();
         let render_resources = RenderResources::new(
             state,
             camera.create_buffer(device),
@@ -405,6 +421,7 @@ impl EditorApp {
                 .uniform()
                 .create_buffer(device),
             interaction_state.hover_on_dyn_obj_id.clone(),
+            render_settings.hd_textures,
         );
 
         state
@@ -430,6 +447,8 @@ impl EditorApp {
             file_reader: FileReader::new(),
             load_err: None,
             save_err: None,
+            #[cfg(target_arch = "wasm32")]
+            save_status: Arc::new(Mutex::new(None)),
 
             world_viewport_rect: Rect::from_x_y_ranges(
                 0.0..=GeometryBuffer::DEFAULT_WIDTH as f32,
@@ -437,6 +456,7 @@ impl EditorApp {
             ),
             mouse_pos: None,
             render_settings: RenderSettings::default(),
+            hd_textures_changed: false,
         }
     }
 
@@ -457,7 +477,7 @@ impl EditorApp {
 
         // By default we look at start portal, wrapped into [0, world_width)
         let wrapped_spawn_x = (spawn_x as f32).rem_euclid(world_block_width);
-        *self.camera.world_offset_mut() = glam::Vec3::new(wrapped_spawn_x, spawn_y as f32, 5.0);
+        *self.camera.world_offset_mut() = glam::Vec3::new(wrapped_spawn_x, spawn_y as f32, 20.0);
 
         // Only allocate a new voxel buffer when the new world is wider than the current one.
         // Reusing the existing (larger) buffer avoids a VRAM allocation on every world load.
@@ -503,94 +523,84 @@ impl EditorApp {
     }
 
     fn render_menu_bar(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("Open").clicked() {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        self.file_reader
-                            .set_open_path(rfd::FileDialog::new().pick_file());
-                    }
-
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        let sender = self.file_reader.get_sender();
-                        let task = rfd::AsyncFileDialog::new().pick_file();
-                        let ctx = ui.ctx().clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            if let Some(file) = task.await {
-                                let bytes = file.read().await;
-                                let _ = sender.send(bytes);
-                                ctx.request_repaint();
-                            }
-                        })
-                    }
-                }
-                let mut arch = None;
-                ui.menu_button("Save As", |ui| {
-                    if ui
-                        .button("32-bit")
-                        .on_hover_text("Save as 32 bit LMDB file, usually for client.")
-                        .clicked()
-                    {
-                        arch = Some(DynArch::Arch32);
-                    }
-                    if ui
-                        .button("64-bit")
-                        .on_hover_text("Save as 64 bit LMDB file, usually for server.")
-                        .clicked()
-                    {
-                        arch = Some(DynArch::Arch64);
-                    }
-                });
-                if let Some(arch) = arch
-                        // TODO if world_db is empty we should return as error
-                        && let Some(world_db) = self.world_db.as_mut()
+        ui.horizontal(|ui| {
+            if ui.button("Save").clicked()
+                && let Some(world_db) = self.world_db.as_mut()
+            {
+                self.chunk_cache.flush(world_db);
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(save_path) = rfd::FileDialog::new().pick_folder()
+                    && let Err(e) = world_db
+                        .to_path(save_path, DynArch::Arch64, true)
+                        .context(SaveWorldDbSnafu)
                 {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        if let Some(save_path) = rfd::FileDialog::new().pick_folder() {
-                            self.chunk_cache.flush(world_db);
-                            if let Err(e) = world_db
-                                .to_path(save_path, arch, true)
-                                .context(SaveWorldDbSnafu)
-                            {
-                                // TODO allow user select arch
-                                self.save_err = Some(e);
-                            }
-                        }
-                    }
+                    self.save_err = Some(e);
+                }
 
-                    #[cfg(target_arch = "wasm32")]
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let mut out_bytes = Vec::new();
+                    match world_db
+                        .write_to(&mut out_bytes, DynArch::Arch64)
+                        .context(SaveWorldDbSnafu)
                     {
-                        self.chunk_cache.flush(world_db);
-                        let mut out_bytes = Vec::new();
-                        match world_db
-                            .write_to(&mut out_bytes, arch)
-                            .context(SaveWorldDbSnafu)
-                        {
-                            Ok(()) => {
-                                let task = rfd::AsyncFileDialog::new()
-                                    .set_file_name("data.mdb")
-                                    .save_file();
-                                let ctx = ui.ctx().clone();
-                                wasm_bindgen_futures::spawn_local(async move {
-                                    if let Some(file) = task.await {
-                                        let _ = file.write(&out_bytes).await;
-                                        ctx.request_repaint();
-                                    }
-                                })
-                            }
-                            Err(e) => {
-                                self.save_err = Some(e);
-                            }
+                        Ok(()) => {
+                            let ctx = ui.ctx().clone();
+                            let save_status = self.save_status.clone();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                let result = wasm_bindgen_futures::JsFuture::from(
+                                    world_editor_save(&out_bytes),
+                                )
+                                .await;
+                                let message = match result {
+                                    Ok(value) => value
+                                        .as_string()
+                                        .unwrap_or_else(|| "World saved.".to_owned()),
+                                    Err(error) => error
+                                        .as_string()
+                                        .unwrap_or_else(|| "Save failed.".to_owned()),
+                                };
+                                *save_status.lock().unwrap() = Some(message);
+                                ctx.request_repaint();
+                            });
                         }
+                        Err(e) => self.save_err = Some(e),
                     }
                 }
-            });
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                let status = world_editor_server_status();
+                if !matches!(
+                    status.as_str(),
+                    "stopped" | "exited" | "not_started" | "not_managed"
+                ) {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        format!("Cannot save unless the server is off (status: {status})."),
+                    );
+                }
+                if let Some(message) = self.save_status.lock().unwrap().as_ref() {
+                    ui.label(message);
+                }
+            }
 
             ui.separator();
             ui.toggle_value(&mut self.render_settings.show_grid, "Grid");
+            if ui.button("Reset Camera").clicked() {
+                if let Some(world_db) = self.world_db.as_ref() {
+                    let spawn_x = world_db.main.world_v2.start_portal_pos_x;
+                    let spawn_y = world_db.main.world_v2.start_portal_pos_y - 1;
+                    let world_width_macro = world_db.main.world_v2.world_width_macro;
+                    let world_block_width = world_width_macro * Chunk::NUM_BLOCK_PER_ROW as u32;
+                    let wrapped_spawn_x = (spawn_x as f32).rem_euclid(world_block_width as f32);
+                    *self.camera.world_offset_mut() =
+                        glam::Vec3::new(wrapped_spawn_x, spawn_y as f32, 20.0);
+                } else {
+                    *self.camera.world_offset_mut() = glam::Vec3::new(0.0, 0.0, 20.0);
+                }
+            }
             ui.toggle_value(&mut self.show_settings, "Settings");
             ui.toggle_value(&mut self.show_world_info, "Info");
 
@@ -765,7 +775,13 @@ impl EditorApp {
                     &mut self.render_settings.enable_cyclic,
                     "Enable Cyclic World",
                 );
+                let hd_changed = ui
+                    .checkbox(&mut self.render_settings.hd_textures, "HD Textures")
+                    .changed();
 
+                if hd_changed {
+                    self.hd_textures_changed = true;
+                }
                 ui.separator();
                 ui.add(
                     egui::Slider::new(&mut self.render_settings.ambient_light, 0.0..=1.0)
@@ -805,13 +821,17 @@ impl EditorApp {
     }
 
     fn update_camera_pos(&mut self, ui: &mut egui::Ui, response: &egui::Response) {
+        let multi_touch = ui.input(|input| input.multi_touch());
         let viewport_size = (
             self.world_viewport_rect.width(),
             self.world_viewport_rect.height(),
         );
 
-        if ((matches!(self.mode, Mode::View) && response.dragged_by(egui::PointerButton::Primary))
-            || (matches!(self.mode, Mode::Pen) && response.dragged_by(egui::PointerButton::Middle)))
+        if multi_touch.is_none()
+            && ((matches!(self.mode, Mode::View)
+                && response.dragged_by(egui::PointerButton::Primary))
+                || (matches!(self.mode, Mode::Pen)
+                    && response.dragged_by(egui::PointerButton::Middle)))
             && let Some(cur_pos) = response.interact_pointer_pos()
         {
             let delta = response.drag_delta();
@@ -842,6 +862,19 @@ impl EditorApp {
                     scroll_y,
                 );
             }
+        }
+
+        if let Some(multi_touch) = multi_touch
+            && self.world_viewport_rect.contains(multi_touch.center_pos)
+            && multi_touch.zoom_delta.is_finite()
+            && multi_touch.zoom_delta > 0.0
+            && (multi_touch.zoom_delta - 1.0).abs() > f32::EPSILON
+        {
+            self.camera.handle_pinch_zoom(
+                (multi_touch.center_pos - self.world_viewport_rect.min).into(),
+                viewport_size,
+                multi_touch.zoom_delta,
+            );
         }
 
         // Wrap camera X cyclically when cyclic mode is enabled and a world is loaded
@@ -1038,6 +1071,21 @@ impl EditorApp {
 
     fn update_outdated_voxel_mesh(&mut self, frame: &eframe::Frame) {
         if let Some(state) = frame.wgpu_render_state() {
+            // Handle HD texture changes
+            if self.hd_textures_changed {
+                let mut write_renderer = state.renderer.write();
+                let r = write_renderer
+                    .callback_resources
+                    .get_mut::<RenderResources>()
+                    .expect("should have render resources");
+                r.recreate_with_hd_textures(
+                    &state.device,
+                    &state.queue,
+                    self.render_settings.hd_textures,
+                );
+                self.hd_textures_changed = false;
+            }
+
             let read_renderer = state.renderer.read();
             let r = read_renderer
                 .callback_resources

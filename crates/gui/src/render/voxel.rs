@@ -3,7 +3,7 @@ use eframe::wgpu::{self, util::DeviceExt};
 
 // Raymarch voxel renderer
 pub struct VoxelRenderer {
-    pub voxel_buf: wgpu::Buffer,
+    pub voxel_buf: voxel_util::VoxelBuffer,
     pub world_dim_x_buf: wgpu::Buffer,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
@@ -11,6 +11,7 @@ pub struct VoxelRenderer {
     buffer_bind_group: wgpu::BindGroup,
     voxel_bind_group_layout: wgpu::BindGroupLayout,
     voxel_bind_group: wgpu::BindGroup,
+    voxel_segment_size_buf: wgpu::Buffer,
 }
 
 impl VoxelRenderer {
@@ -23,6 +24,7 @@ impl VoxelRenderer {
         device: &wgpu::Device,
         camera_buf: &wgpu::Buffer,
         world_dim_x_buf: wgpu::Buffer,
+        voxel_buf: voxel_util::VoxelBuffer,
         selected_block_buf: &wgpu::Buffer,
         hover_on_block_buf: &wgpu::Buffer,
         hover_on_id_buf: &wgpu::Buffer,
@@ -291,27 +293,46 @@ impl VoxelRenderer {
             Self::create_buffer_bind_group(device, &buffer_bind_group_layout, g_buffer);
 
         // --- Group 2: per-world voxel data (rebuilt on world load with different width) ---
+        let segment_count = voxel_buf.buffers().len();
+        let mut voxel_bind_group_entries = (0..segment_count)
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding: binding as u32,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect::<Vec<_>>();
+        voxel_bind_group_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: segment_count as u32,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
         let voxel_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Voxel Data Bind Group Layout"),
-                entries: &[
-                    // voxel storage buffer
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
+                entries: &voxel_bind_group_entries,
             });
 
-        let voxel_buf = voxel_util::create_buffer(device, Self::DEFAULT_WORLD_WIDTH_CHUNK as usize);
-        let voxel_bind_group =
-            Self::create_voxel_bind_group(device, &voxel_bind_group_layout, &voxel_buf);
+        let voxel_segment_size_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Voxel Buffer Segment Size"),
+            contents: bytemuck::cast_slice(&[voxel_buf.segment_size_words()]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let voxel_bind_group = Self::create_voxel_bind_group(
+            device,
+            &voxel_bind_group_layout,
+            &voxel_buf,
+            &voxel_segment_size_buf,
+        );
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
@@ -395,6 +416,7 @@ impl VoxelRenderer {
             voxel_bind_group,
             voxel_buf,
             world_dim_x_buf,
+            voxel_segment_size_buf,
         }
     }
 
@@ -422,14 +444,25 @@ impl VoxelRenderer {
     fn create_voxel_bind_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
-        voxel_buf: &wgpu::Buffer,
+        voxel_buf: &voxel_util::VoxelBuffer,
+        voxel_segment_size_buf: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
+        let entries = voxel_buf
+            .buffers()
+            .iter()
+            .enumerate()
+            .map(|(binding, buffer)| wgpu::BindGroupEntry {
+                binding: binding as u32,
+                resource: buffer.as_entire_binding(),
+            })
+            .chain(std::iter::once(wgpu::BindGroupEntry {
+                binding: voxel_buf.buffers().len() as u32,
+                resource: voxel_segment_size_buf.as_entire_binding(),
+            }))
+            .collect::<Vec<_>>();
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: voxel_buf.as_entire_binding(),
-            }],
+            entries: &entries,
             label: Some("Voxel Data Bind Group"),
         })
     }
@@ -443,7 +476,7 @@ impl VoxelRenderer {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        new_voxel_buf: wgpu::Buffer,
+        new_voxel_buf: voxel_util::VoxelBuffer,
         world_dim_x: u32,
     ) {
         queue.write_buffer(
@@ -451,9 +484,18 @@ impl VoxelRenderer {
             0,
             bytemuck::cast_slice(&[world_dim_x]),
         );
+        queue.write_buffer(
+            &self.voxel_segment_size_buf,
+            0,
+            bytemuck::cast_slice(&[new_voxel_buf.segment_size_words()]),
+        );
         self.voxel_buf = new_voxel_buf;
-        self.voxel_bind_group =
-            Self::create_voxel_bind_group(device, &self.voxel_bind_group_layout, &self.voxel_buf);
+        self.voxel_bind_group = Self::create_voxel_bind_group(
+            device,
+            &self.voxel_bind_group_layout,
+            &self.voxel_buf,
+            &self.voxel_segment_size_buf,
+        );
     }
 
     pub fn render(&self, render_pass: &mut wgpu::RenderPass<'_>) {

@@ -108,7 +108,14 @@ struct TraversalResult {
 @group(1) @binding(0) var mesh_id_texture: texture_2d<u32>;
 @group(1) @binding(1) var mesh_flags_texture: texture_2d<u32>;
 
-@group(2) @binding(0) var<storage, read> voxel_data: array<u32>;
+@group(2) @binding(0) var<storage, read> voxel_data_0: array<u32>;
+@group(2) @binding(1) var<storage, read> voxel_data_1: array<u32>;
+@group(2) @binding(2) var<storage, read> voxel_data_2: array<u32>;
+@group(2) @binding(3) var<storage, read> voxel_data_3: array<u32>;
+@group(2) @binding(4) var<storage, read> voxel_data_4: array<u32>;
+@group(2) @binding(5) var<storage, read> voxel_data_5: array<u32>;
+@group(2) @binding(6) var<storage, read> voxel_data_6: array<u32>;
+@group(2) @binding(7) var<uniform> voxel_buffer_segment_size: u32;
 
 fn wrap_voxel_x(x: i32) -> i32 {
     if render_settings.enable_cyclic == 0u {
@@ -151,12 +158,22 @@ fn get_voxel_type(global_voxel_coords: vec3<i32>) -> u32 {
 
     let final_index = chunk_offset + local_voxel_index;
 
-    let data = voxel_data[final_index >> 1];
-    if ((final_index & 1) != 0) {
-        return data >> 16;
-    } else {
-        return data & 0xFFFFu;
+    let data_index = final_index >> 2;
+    let segment_index = data_index / voxel_buffer_segment_size;
+    let segment_offset = data_index % voxel_buffer_segment_size;
+    var data: u32;
+    switch segment_index {
+        case 0u: { data = voxel_data_0[segment_offset]; }
+        case 1u: { data = voxel_data_1[segment_offset]; }
+        case 2u: { data = voxel_data_2[segment_offset]; }
+        case 3u: { data = voxel_data_3[segment_offset]; }
+        case 4u: { data = voxel_data_4[segment_offset]; }
+        case 5u: { data = voxel_data_5[segment_offset]; }
+        case 6u: { data = voxel_data_6[segment_offset]; }
+        default: { return AIR_TYPE; }
     }
+    let byte_shift = (final_index & 3u) * 8u;
+    return (data >> byte_shift) & 0xFFu;
 }
 
 fn get_atlas_uv(voxel_type: u32, hit_face_id: u32, uv_on_face: vec2<f32>) -> vec2<f32> {
@@ -165,7 +182,14 @@ fn get_atlas_uv(voxel_type: u32, hit_face_id: u32, uv_on_face: vec2<f32>) -> vec
     let tile_x = f32(tile_index % TILES_PER_ROW);
     let tile_y = f32(tile_index / TILES_PER_ROW);
     let uv_min_tile = vec2<f32>(tile_x * TILE_SIZE_UV, tile_y * TILE_SIZE_UV);
-    return uv_min_tile + uv_on_face * TILE_SIZE_UV;
+    let tile_size = vec2<f32>(TILE_SIZE_UV);
+    let half_texel_in_tile = 0.5 / (vec2<f32>(textureDimensions(texture_atlas)) * tile_size);
+    let clamped_uv = clamp(
+        uv_on_face,
+        half_texel_in_tile,
+        vec2<f32>(1.0) - half_texel_in_tile,
+    );
+    return uv_min_tile + clamped_uv * tile_size;
 }
 
 fn sample_texture_by_face(voxel_type: u32, hit_face_id: u32, uv_on_face: vec2<f32>) -> vec4<f32> {

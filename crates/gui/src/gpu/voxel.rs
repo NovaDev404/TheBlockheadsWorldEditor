@@ -5,7 +5,7 @@ use the_blockheads_tools_lib::game::block::{
 };
 
 // Basically the same as BlockType, but treats block with tile content as separate type
-#[repr(u16)]
+#[repr(u8)]
 #[derive(
     Debug, Copy, Clone, bytemuck::Zeroable, bytemuck::NoUninit, PartialEq, Eq, TryFromPrimitive,
 )]
@@ -201,7 +201,7 @@ impl BlockUv {
 
 impl From<BlockType> for VoxelType {
     fn from(value: BlockType) -> Self {
-        Self::try_from(value as u16).expect("all block types should be able to map to voxel type")
+        Self::try_from(value as u8).expect("all block types should be able to map to voxel type")
     }
 }
 
@@ -553,7 +553,7 @@ impl VoxelType {
     pub(crate) fn uv_at_face() -> Vec<[ImageType; 6]> {
         (0..VoxelType::MAX_VALUE)
             .map(|voxel_type_id| {
-                VoxelType::try_from(voxel_type_id)
+                VoxelType::try_from(voxel_type_id as u8)
                     .unwrap_or(VoxelType::Unknown)
                     .uv()
                     .face_images()
@@ -573,19 +573,60 @@ pub mod voxel_util {
     const NUM_VOXEL_DEPTH: usize = 3;
     const NUM_BLOCK_PER_CHUNK: usize =
         Chunk::NUM_BLOCK_PER_ROW * Chunk::NUM_BLOCK_PER_COL * NUM_VOXEL_DEPTH; // 3 layers
+    const NUM_VOXEL_BUFFERS: usize = 7;
 
-    // Costly function - only call this once or VRAM nuked
-    // Contains flattened block type, 512 * 32 * (32 * 32 * 3) blocks
-    pub fn create_buffer(device: &wgpu::Device, world_width_macro: usize) -> wgpu::Buffer {
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Global Voxel Data Buffer"),
-            contents: bytemuck::cast_slice(&new_world_voxel(world_width_macro)),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        })
+    #[derive(Clone)]
+    pub struct VoxelBuffer {
+        buffers: [wgpu::Buffer; NUM_VOXEL_BUFFERS],
+        chunks_per_buffer: usize,
+        segment_size_words: u32,
     }
 
-    fn new_world_voxel(world_width_macro: usize) -> Vec<VoxelType> {
-        vec![VoxelType::Air; NUM_BLOCK_PER_CHUNK * Chunks::NUM_CHUNK_PER_COL * world_width_macro]
+    impl VoxelBuffer {
+        pub fn buffers(&self) -> &[wgpu::Buffer; NUM_VOXEL_BUFFERS] {
+            &self.buffers
+        }
+
+        pub fn segment_size_words(&self) -> u32 {
+            self.segment_size_words
+        }
+    }
+
+    pub fn create_buffer(device: &wgpu::Device, world_width_macro: usize) -> VoxelBuffer {
+        let total_chunks = Chunks::NUM_CHUNK_PER_COL * world_width_macro;
+        let chunks_per_buffer = total_chunks.div_ceil(NUM_VOXEL_BUFFERS);
+        let bytes_per_chunk = (NUM_BLOCK_PER_CHUNK * size_of::<VoxelType>()) as u64;
+        let segment_size_bytes = chunks_per_buffer as u64 * bytes_per_chunk;
+        let limits = device.limits();
+        let max_segment_size =
+            u64::from(limits.max_storage_buffer_binding_size).min(limits.max_buffer_size);
+        assert!(
+            segment_size_bytes <= max_segment_size,
+            "Voxel world segment size {segment_size_bytes} exceeds device storage-buffer limit {max_segment_size}"
+        );
+
+        let buffers = std::array::from_fn(|segment_index| {
+            let first_chunk = segment_index * chunks_per_buffer;
+            let segment_chunks = total_chunks
+                .saturating_sub(first_chunk)
+                .min(chunks_per_buffer);
+            let world_voxel = new_world_voxel(segment_chunks);
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Voxel Data Segment"),
+                contents: bytemuck::cast_slice(&world_voxel),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            })
+        });
+
+        VoxelBuffer {
+            buffers,
+            chunks_per_buffer,
+            segment_size_words: (segment_size_bytes / size_of::<u32>() as u64) as u32,
+        }
+    }
+
+    fn new_world_voxel(chunk_count: usize) -> Vec<VoxelType> {
+        vec![VoxelType::Air; NUM_BLOCK_PER_CHUNK * chunk_count]
     }
 
     fn fill_chunk_voxel(chunk: ChunkView<'_>, chunk_voxel: &mut [VoxelType]) {
@@ -612,12 +653,18 @@ pub mod voxel_util {
     // This method builds world_voxel with only 2 malloc!
     // This also turns out to help with I/O speed, based on observation that the editor
     // will likely never edit >95% of the chunks decompressed.
-    fn build_world_voxel(chunks: &Chunks, world_width_macro: usize) -> Vec<VoxelType> {
-        let mut world_voxel = new_world_voxel(world_width_macro);
+    fn build_world_voxel(
+        chunks: &Chunks,
+        first_chunk: usize,
+        chunk_count: usize,
+    ) -> Vec<VoxelType> {
+        let mut world_voxel = new_world_voxel(chunk_count);
         let mut decompress_output = Vec::with_capacity(Chunk::NUM_BYTES);
         chunks
             .inner()
             .iter()
+            .skip(first_chunk)
+            .take(chunk_count)
             .zip(world_voxel.chunks_exact_mut(NUM_BLOCK_PER_CHUNK))
             .for_each(|(chunk, chunk_voxel)| {
                 if let Some(chunk) = chunk
@@ -631,17 +678,24 @@ pub mod voxel_util {
 
     pub fn set_chunks(
         queue: &wgpu::Queue,
-        voxel_buffer: &wgpu::Buffer,
+        voxel_buffer: &VoxelBuffer,
         chunks: &mut Chunks,
         world_width_macro: usize,
     ) {
-        let world_voxel = build_world_voxel(chunks, world_width_macro);
-        queue.write_buffer(voxel_buffer, 0, bytemuck::cast_slice(&world_voxel));
+        let total_chunks = Chunks::NUM_CHUNK_PER_COL * world_width_macro;
+        for (segment_index, buffer) in voxel_buffer.buffers.iter().enumerate() {
+            let first_chunk = segment_index * voxel_buffer.chunks_per_buffer;
+            let segment_chunks = total_chunks
+                .saturating_sub(first_chunk)
+                .min(voxel_buffer.chunks_per_buffer);
+            let world_voxel = build_world_voxel(chunks, first_chunk, segment_chunks);
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&world_voxel));
+        }
     }
 
     pub fn set_chunk<I: Into<ChunkCoord>>(
         queue: &wgpu::Queue,
-        voxel_buffer: &wgpu::Buffer,
+        voxel_buffer: &VoxelBuffer,
         coord: I,
         chunk: &Chunk,
     ) {
@@ -649,12 +703,15 @@ pub mod voxel_util {
         fill_chunk_voxel(chunk.view(), &mut blocks);
 
         let chunk_coord: ChunkCoord = coord.into();
-        let offset = (chunk_coord.x() * Chunk::NUM_BLOCK_PER_COL as u32 + chunk_coord.y() as u32)
-            * NUM_BLOCK_PER_CHUNK as u32;
+        let chunk_index =
+            chunk_coord.x() as usize * Chunks::NUM_CHUNK_PER_COL + chunk_coord.y() as usize;
+        let segment_index = chunk_index / voxel_buffer.chunks_per_buffer;
+        let chunk_in_segment = chunk_index % voxel_buffer.chunks_per_buffer;
+        let offset = chunk_in_segment * NUM_BLOCK_PER_CHUNK * size_of::<VoxelType>();
 
         queue.write_buffer(
-            voxel_buffer,
-            offset as u64 * size_of::<u16>() as u64,
+            &voxel_buffer.buffers[segment_index],
+            offset as u64,
             bytemuck::cast_slice(&blocks),
         );
     }

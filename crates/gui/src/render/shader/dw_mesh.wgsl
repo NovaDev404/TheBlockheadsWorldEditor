@@ -12,6 +12,7 @@ struct VertexInput {
     @location(2) position: vec3<f32>,
     @location(3) normal: vec3<f32>,
     @location(4) tex_coords: vec2<f32>,
+    @location(5) is_sign_text: u32,
 };
 
 struct VertexOutput {
@@ -21,6 +22,7 @@ struct VertexOutput {
     @location(2) @interpolate(flat) id: u32,
     @location(3) @interpolate(flat) chunk: u32,
     @location(4) world_pos: vec3<f32>,
+    @location(5) @interpolate(flat) is_sign_text: u32,
 };
 
 //!include render_settings.wgsl
@@ -29,6 +31,8 @@ struct VertexOutput {
 @group(0) @binding(4) var<uniform> world_dim_x: u32;
 @group(0) @binding(5) var<uniform> hover_on_id: IdUniform;
 @group(0) @binding(6) var<uniform> selected_id: IdUniform;
+@group(0) @binding(7) var sign_font_texture: texture_2d<f32>;
+@group(0) @binding(8) var sign_font_sampler: sampler;
 
 struct FragmentOutput {
     @location(0) uv: vec2<f32>,
@@ -53,6 +57,7 @@ fn vs_main(model: VertexInput) -> VertexOutput {
     out.chunk = model.chunk;
     out.normal = model.normal;
     out.world_pos = vec3<f32>(camera.world_offset.x + pos_in_view.x, model.position.y, model.position.z);
+    out.is_sign_text = model.is_sign_text;
     return out;
 }
 
@@ -68,7 +73,10 @@ fn calculate_translucent_lighting(base_color: vec3<f32>, face_normal: vec3<f32>,
 
 @fragment
 fn fs_main(in: VertexOutput) -> FragmentOutput {
-    let color = textureSample(tilemap_texture, tilemap_sampler, in.tex_coords);
+    let tile_color = textureSample(tilemap_texture, tilemap_sampler, in.tex_coords);
+    let glyph = textureSample(sign_font_texture, sign_font_sampler, in.tex_coords);
+    let sign_color = vec4<f32>(vec3<f32>(0.035, 0.018, 0.008), glyph.a);
+    let color = select(tile_color, sign_color, in.is_sign_text != 0u);
 
     if (color.a == 0.0) {
         discard;
@@ -94,6 +102,15 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
         if (selected) {
             mesh_flags |= 2u;
         }
+    }
+
+    if (in.is_sign_text != 0u) {
+        output.depth = in.clip_position.z;
+        output.uv = vec2<f32>(0.0);
+        output.normal = vec4<f32>(normalize(in.normal), 0.0);
+        output.translucency = color;
+        output.mesh_flags = mesh_flags;
+        return output;
     }
 
     if (color.a < 1.0) {
@@ -122,6 +139,9 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
 @fragment
 fn fs_translucent_depth(in: VertexOutput) -> @builtin(frag_depth) f32 {
     let color = textureSample(tilemap_texture, tilemap_sampler, in.tex_coords);
+    if (in.is_sign_text != 0u) {
+        discard;
+    }
 
     // Discard fully opaque pixels (they already wrote depth in main pass)
     // Discard fully transparent pixels (they shouldn't write depth)

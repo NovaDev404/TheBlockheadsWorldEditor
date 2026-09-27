@@ -463,6 +463,7 @@ pub mod workbench;
 #[derive(Debug, Clone, PartialEq, IntoStaticStr)]
 pub enum AnyDynamicObject {
     Dodo(Box<animal::Dodo>),                      // ID = 13
+    Torch(Box<craft::Torch>),                     // Lantern/torch save dictionary
     Ladder(Box<craft::Ladder>),                   // ID = 19
     Door(Box<craft::Door>),                       // ID = 20
     Bed(Box<craft::Bed>),                         // ID = 23
@@ -502,6 +503,7 @@ impl AnyDynamicObject {
     pub fn set_float_pos(&mut self, pos: [f32; 2]) {
         match self {
             AnyDynamicObject::Dodo(dodo) => dodo.set_float_pos(pos),
+            AnyDynamicObject::Torch(torch) => torch.set_float_pos(pos),
             AnyDynamicObject::Ladder(ladder) => ladder.set_float_pos(pos),
             AnyDynamicObject::Door(door) => door.set_float_pos(pos),
             AnyDynamicObject::Bed(bed) => bed.set_float_pos(pos),
@@ -535,6 +537,7 @@ impl AnyDynamicObject {
     pub fn set_pos(&mut self, pos: (u32, u16)) {
         match self {
             AnyDynamicObject::Dodo(dodo) => dodo.set_pos(pos),
+            AnyDynamicObject::Torch(torch) => torch.set_pos(pos),
             AnyDynamicObject::Ladder(ladder) => ladder.set_pos(pos),
             AnyDynamicObject::Door(door) => door.set_pos(pos),
             AnyDynamicObject::Bed(bed) => bed.set_pos(pos),
@@ -568,6 +571,7 @@ impl AnyDynamicObject {
     pub fn set_unique_id(&mut self, unique_id: UniqueID) {
         match self {
             AnyDynamicObject::Dodo(dodo) => dodo.unique_id = unique_id,
+            AnyDynamicObject::Torch(torch) => torch.unique_id = unique_id,
             AnyDynamicObject::Ladder(ladder) => ladder.unique_id = unique_id,
             AnyDynamicObject::Door(door) => door.unique_id = unique_id,
             AnyDynamicObject::Bed(bed) => bed.unique_id = unique_id,
@@ -607,6 +611,20 @@ impl AnyDynamicObject {
                     dict: value,
                 })?;
                 Ok(Self::Dodo(dodo))
+            }
+            ItemType::Torch
+            | ItemType::IceTorch
+            | ItemType::AmethystChandelier
+            | ItemType::SapphireChandelier
+            | ItemType::EmeraldChandelier
+            | ItemType::RubyChandelier
+            | ItemType::DiamondChandelier
+            | ItemType::SteelLantern => {
+                let torch = plist::from_value(&value).context(DeserializeDictionarySnafu {
+                    target_type: "Torch",
+                    dict: value,
+                })?;
+                Ok(Self::Torch(Box::new(torch)))
             }
             ItemType::Ladder => {
                 // ID = 19
@@ -946,6 +964,18 @@ impl AnyDynamicObject {
                 })?;
                 Ok(Self::Mirror(Box::new(mirror)))
             }
+            _ if matches!(
+                &value,
+                plist::Value::Dictionary(dict)
+                    if dict.contains_key("connectionType") && dict.contains_key("lightDict")
+            ) =>
+            {
+                let torch = plist::from_value(&value).context(DeserializeDictionarySnafu {
+                    target_type: "Torch",
+                    dict: value,
+                })?;
+                Ok(Self::Torch(Box::new(torch)))
+            }
             _ => UnsupportedItemTypeForDynObjSnafu { item_type, value }.fail(),
         }
     }
@@ -954,6 +984,9 @@ impl AnyDynamicObject {
         Ok(match self {
             Self::Dodo(dodo) => plist::to_value(dodo).context(SerializeDictionarySnafu {
                 source_type: "Dodo",
+            })?,
+            Self::Torch(torch) => plist::to_value(torch).context(SerializeDictionarySnafu {
+                source_type: "Torch",
             })?,
             Self::Ladder(ladder) => plist::to_value(ladder).context(SerializeDictionarySnafu {
                 source_type: "Ladder",
@@ -1079,7 +1112,8 @@ impl AnyDynamicObject {
 
 #[derive(Debug, PartialEq, IntoStaticStr)]
 pub enum AnyDynamicObjectRef<'a> {
-    Dodo(&'a animal::Dodo),                      // ID = 13
+    Dodo(&'a animal::Dodo), // ID = 13
+    Torch(&'a craft::Torch),
     Ladder(&'a craft::Ladder),                   // ID = 19
     Door(&'a craft::Door),                       // ID = 20
     Bed(&'a craft::Bed),                         // ID = 23
@@ -1113,6 +1147,7 @@ impl<'a> AnyDynamicObjectRef<'a> {
     pub fn to_owned(&self) -> AnyDynamicObject {
         match *self {
             AnyDynamicObjectRef::Dodo(x) => AnyDynamicObject::Dodo(Box::new(x.clone())),
+            AnyDynamicObjectRef::Torch(x) => AnyDynamicObject::Torch(Box::new(x.clone())),
             AnyDynamicObjectRef::Ladder(x) => AnyDynamicObject::Ladder(Box::new(x.clone())),
             AnyDynamicObjectRef::Door(x) => AnyDynamicObject::Door(Box::new(x.clone())),
             AnyDynamicObjectRef::Bed(x) => AnyDynamicObject::Bed(Box::new(x.clone())),
@@ -1163,7 +1198,8 @@ impl<'a> AnyDynamicObjectRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DynamicObjectList, DynamicObjectType, FireObjectXml, GatherBlock, GlowBlock,
+        AnyDynamicObject, DynamicObjectList, DynamicObjectType, FireObjectXml, GatherBlock,
+        GlowBlock,
         animal::{CaveTroll, ClownFish, Dodo, Donkey, DropBear, Egg, Scorpion, Shark, Yak},
         chest::ChestDwXml,
         craft::{
@@ -1182,7 +1218,84 @@ mod tests {
         },
         workbench::Workbench,
     };
+    use crate::game::item::ItemType;
     use crate::util::plist::diff_plist_keys;
+
+    #[test]
+    fn steel_lantern_save_dict_round_trips_without_light_dict() {
+        let value = plist::from_bytes(
+            br#"<plist version="1.0"><dict>
+            <key>connectionType</key><integer>0</integer>
+            <key>dataA</key><integer>0</integer>
+            <key>dataB</key><integer>0</integer>
+            <key>floatPos</key><array><real>1219.5</real><real>512</real></array>
+            <key>itemType</key><integer>150</integer>
+            <key>pos_x</key><integer>1219</integer>
+            <key>pos_y</key><integer>512</integer>
+            <key>uniqueID</key><integer>9420295</integer>
+        </dict></plist>"#,
+        )
+        .unwrap();
+
+        let lantern = AnyDynamicObject::try_from_save_dict(ItemType::SteelLantern, value).unwrap();
+        assert!(matches!(&lantern, AnyDynamicObject::Torch(_)));
+
+        let saved = lantern.to_save_dict().unwrap();
+        let reloaded = AnyDynamicObject::try_from_save_dict(ItemType::SteelLantern, saved).unwrap();
+        assert_eq!(lantern, reloaded);
+    }
+
+    #[test]
+    fn gemstone_light_save_dict_preserves_item_type() {
+        let item_types = [
+            ItemType::Amethyst,
+            ItemType::Sapphire,
+            ItemType::Ruby,
+            ItemType::Diamond,
+            ItemType::Emerald,
+        ];
+
+        for item_type in item_types {
+            let xml = format!(
+                r#"<plist version="1.0"><dict>
+            <key>connectionType</key><integer>-2</integer>
+            <key>dataA</key><integer>0</integer>
+            <key>dataB</key><integer>0</integer>
+            <key>floatPos</key><array><real>35721.5</real><real>537</real></array>
+            <key>itemType</key><integer>{}</integer>
+            <key>lightDict</key><dict>
+                <key>contributionGridOrigin.x</key><integer>35717</integer>
+                <key>contributionGridOrigin.y</key><integer>533</integer>
+                <key>floatPos</key><array><real>35721.5</real><real>537</real></array>
+                <key>lightDirection</key><integer>0</integer>
+                <key>maxBlue</key><integer>220</integer>
+                <key>maxGreen</key><integer>115</integer>
+                <key>maxHeat</key><integer>0</integer>
+                <key>maxRed</key><integer>135</integer>
+                <key>pos_x</key><integer>35721</integer>
+                <key>pos_y</key><integer>537</integer>
+                <key>radius</key><integer>4</integer>
+                <key>uniqueID</key><integer>3085</integer>
+            </dict>
+            <key>pos_x</key><integer>35721</integer>
+            <key>pos_y</key><integer>537</integer>
+            <key>uniqueID</key><integer>3084</integer>
+        </dict></plist>"#,
+                item_type as u16
+            );
+            let value = plist::from_bytes(xml.as_bytes()).unwrap();
+
+            let gemstone = AnyDynamicObject::try_from_save_dict(item_type, value).unwrap();
+            assert!(matches!(
+                &gemstone,
+                AnyDynamicObject::Torch(torch) if torch.item_type == item_type
+            ));
+
+            let saved = gemstone.to_save_dict().unwrap();
+            let reloaded = AnyDynamicObject::try_from_save_dict(item_type, saved).unwrap();
+            assert_eq!(gemstone, reloaded);
+        }
+    }
 
     fn check_round_trip<T>(obj_type: DynamicObjectType) -> Result<(), Box<dyn std::error::Error>>
     where

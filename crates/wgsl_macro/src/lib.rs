@@ -6,8 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn resolve_includes(current_file: &Path, files_visited: &mut Vec<PathBuf>) -> String {
-    let content =
-        fs::read_to_string(current_file).unwrap_or_else(|_| panic!("Failed to read {:?}", current_file));
+    let content = fs::read_to_string(current_file)
+        .unwrap_or_else(|_| panic!("Failed to read {:?}", current_file));
     files_visited.push(current_file.to_path_buf());
 
     let mut resolved_content = String::new();
@@ -32,7 +32,11 @@ fn resolve_includes(current_file: &Path, files_visited: &mut Vec<PathBuf>) -> St
 #[proc_macro]
 pub fn include_wgsl(input: TokenStream) -> TokenStream {
     // The input is a string literal. Extract its value.
-    let input_str = input.into_iter().next().expect("Expected string literal").to_string();
+    let input_str = input
+        .into_iter()
+        .next()
+        .expect("Expected string literal")
+        .to_string();
     let relative_path = input_str.trim_matches('"');
 
     // Resolve relative to the calling crate's manifest dir
@@ -46,11 +50,16 @@ pub fn include_wgsl(input: TokenStream) -> TokenStream {
     output.push_str("{\n");
     for file in files_visited {
         let file_str = file.to_str().unwrap().replace("\\", "/");
-        output.push_str(&format!("    const _: &[u8] = include_bytes!(r#\"{}\"#);\n", file_str));
+        output.push_str(&format!(
+            "    const _: &[u8] = include_bytes!(r#\"{}\"#);\n",
+            file_str
+        ));
     }
     // Output the fully resolved shader
     output.push_str(&format!("    r#\"{}\"#\n", resolved_content));
     output.push_str("}\n");
 
-    output.parse().expect("Failed to parse generated TokenStream")
+    output
+        .parse()
+        .expect("Failed to parse generated TokenStream")
 }

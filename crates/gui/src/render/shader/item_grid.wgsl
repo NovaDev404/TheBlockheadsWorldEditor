@@ -94,20 +94,6 @@ fn fs_main(in: VSOutput) -> @location(0) vec4<f32> {
         color = sample_item_texture(in.item_type, is_block, in.top, in.side, in.uv);
     }
 
-    let outline_width: f32 = 0.03;
-    let dist_from_edge_x = min(in.uv.x, 1.0 - in.uv.x);
-    let dist_from_edge_y = min(in.uv.y, 1.0 - in.uv.y);
-
-    if (dist_from_edge_x < outline_width || dist_from_edge_y < outline_width) {
-        if (in.id == uniforms.selected_id) {
-            let outline_color = vec4<f32>(1.0, 1.0, 0.0, 1.0);
-            color = mix(color, outline_color, outline_color.a);
-        } else if (in.id == uniforms.hovered_id) {
-            let outline_color = vec4<f32>(1.0, 1.0, 1.0, 0.5);
-            color = mix(color, outline_color, outline_color.a);
-        }
-    }
-
     // Gamma correction
     let gamma = 2.2;
     let corrected = pow(color.rgb, vec3<f32>(1.0 / gamma));
