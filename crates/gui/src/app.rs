@@ -40,6 +40,9 @@ unsafe extern "C" {
 
     #[wasm_bindgen(js_namespace = window, js_name = worldEditorSave)]
     fn world_editor_save(data: &[u8]) -> js_sys::Promise;
+
+    #[wasm_bindgen(js_namespace = window, js_name = worldEditorLoadError)]
+    fn world_editor_load_error(error_message: &str);
 }
 
 enum ReaderState {
@@ -651,7 +654,10 @@ impl EditorApp {
                     self.open_world_db(bytes, &state.device, &state.queue, r)
                 })
         {
+            let error_message = e.to_string();
             self.load_err = Some(e);
+            #[cfg(target_arch = "wasm32")]
+            world_editor_load_error(&error_message);
         }
     }
 
